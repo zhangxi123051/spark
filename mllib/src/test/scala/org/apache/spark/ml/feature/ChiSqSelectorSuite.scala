@@ -110,8 +110,7 @@ class ChiSqSelectorSuite extends MLTest with DefaultReadWriteTest {
 
   test("params") {
     ParamsSuite.checkParams(new ChiSqSelector)
-    val model = new ChiSqSelectorModel("myModel",
-      new org.apache.spark.mllib.feature.ChiSqSelectorModel(Array(1, 3, 4)))
+    val model = new ChiSqSelectorModel("myModel", Array(1, 3, 4))
     ParamsSuite.checkParams(model)
   }
 
@@ -161,6 +160,17 @@ class ChiSqSelectorSuite extends MLTest with DefaultReadWriteTest {
       css, spark) { (expected, actual) =>
         assert(expected.selectedFeatures === actual.selectedFeatures)
       }
+  }
+
+  test("SPARK-25289: ChiSqSelector should not fail when selecting no features with FDR") {
+    val labeledPoints = (0 to 1).map { n =>
+        val v = Vectors.dense((1 to 3).map(_ => n * 1.0).toArray)
+        (n.toDouble, v)
+      }
+    val inputDF = spark.createDataFrame(labeledPoints).toDF("label", "features")
+    val selector = new ChiSqSelector().setSelectorType("fdr").setFdr(0.05)
+    val model = selector.fit(inputDF)
+    assert(model.selectedFeatures.isEmpty)
   }
 
   private def testSelector(selector: ChiSqSelector, data: Dataset[_]): ChiSqSelectorModel = {

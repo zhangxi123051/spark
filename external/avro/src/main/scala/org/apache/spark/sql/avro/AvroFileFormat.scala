@@ -19,31 +19,28 @@ package org.apache.spark.sql.avro
 
 import java.io._
 import java.net.URI
-import java.util.zip.Deflater
 
 import scala.util.control.NonFatal
 
-import com.esotericsoftware.kryo.{Kryo, KryoSerializable}
-import com.esotericsoftware.kryo.io.{Input, Output}
 import org.apache.avro.Schema
-import org.apache.avro.file.{DataFileConstants, DataFileReader}
+import org.apache.avro.file.DataFileReader
 import org.apache.avro.generic.{GenericDatumReader, GenericRecord}
-import org.apache.avro.mapred.{AvroOutputFormat, FsInput}
-import org.apache.avro.mapreduce.AvroJob
+import org.apache.avro.mapred.FsInput
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileStatus, Path}
 import org.apache.hadoop.mapreduce.Job
-import org.slf4j.LoggerFactory
 
 import org.apache.spark.TaskContext
+import org.apache.spark.internal.Logging
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.execution.datasources.{FileFormat, OutputWriterFactory, PartitionedFile}
 import org.apache.spark.sql.sources.{DataSourceRegister, Filter}
-import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.types._
+import org.apache.spark.util.SerializableConfiguration
 
-private[avro] class AvroFileFormat extends FileFormat with DataSourceRegister {
-  private val log = LoggerFactory.getLogger(getClass)
+private[sql] class AvroFileFormat extends FileFormat
+  with DataSourceRegister with Logging with Serializable {
 
   override def equals(other: Any): Boolean = other match {
     case _: AvroFileFormat => true
@@ -57,51 +54,12 @@ private[avro] class AvroFileFormat extends FileFormat with DataSourceRegister {
       spark: SparkSession,
       options: Map[String, String],
       files: Seq[FileStatus]): Option[StructType] = {
-    val conf = spark.sparkContext.hadoopConfiguration
-    val parsedOptions = new AvroOptions(options, conf)
-
-    // Schema evolution is not supported yet. Here we only pick a single random sample file to
-    // figure out the schema of the whole dataset.
-    val sampleFile =
-      if (parsedOptions.ignoreExtension) {
-        files.headOption.getOrElse {
-          throw new FileNotFoundException("Files for schema inferring have been not found.")
-        }
-      } else {
-        files.find(_.getPath.getName.endsWith(".avro")).getOrElse {
-          throw new FileNotFoundException(
-            "No Avro files found. If files don't have .avro extension, set ignoreExtension to true")
-        }
-      }
-
-    // User can specify an optional avro json schema.
-    val avroSchema = parsedOptions.schema
-      .map(new Schema.Parser().parse)
-      .getOrElse {
-        val in = new FsInput(sampleFile.getPath, conf)
-        try {
-          val reader = DataFileReader.openReader(in, new GenericDatumReader[GenericRecord]())
-          try {
-            reader.getSchema
-          } finally {
-            reader.close()
-          }
-        } finally {
-          in.close()
-        }
-      }
-
-    SchemaConverters.toSqlType(avroSchema).dataType match {
-      case t: StructType => Some(t)
-      case _ => throw new RuntimeException(
-        s"""Avro schema cannot be converted to a Spark SQL StructType:
-           |
-           |${avroSchema.toString(true)}
-           |""".stripMargin)
-    }
+    AvroUtils.inferSchema(spark, options, files)
   }
 
   override def shortName(): String = "avro"
+
+  override def toString(): String = "Avro"
 
   override def isSplitable(
       sparkSession: SparkSession,
@@ -113,38 +71,7 @@ private[avro] class AvroFileFormat extends FileFormat with DataSourceRegister {
       job: Job,
       options: Map[String, String],
       dataSchema: StructType): OutputWriterFactory = {
-    val parsedOptions = new AvroOptions(options, spark.sessionState.newHadoopConf())
-    val outputAvroSchema = SchemaConverters.toAvroType(
-      dataSchema, nullable = false, parsedOptions.recordName, parsedOptions.recordNamespace)
-
-    AvroJob.setOutputKeySchema(job, outputAvroSchema)
-    val AVRO_COMPRESSION_CODEC = "spark.sql.avro.compression.codec"
-    val AVRO_DEFLATE_LEVEL = "spark.sql.avro.deflate.level"
-    val COMPRESS_KEY = "mapred.output.compress"
-
-    spark.conf.get(AVRO_COMPRESSION_CODEC, "snappy") match {
-      case "uncompressed" =>
-        log.info("writing uncompressed Avro records")
-        job.getConfiguration.setBoolean(COMPRESS_KEY, false)
-
-      case "snappy" =>
-        log.info("compressing Avro output using Snappy")
-        job.getConfiguration.setBoolean(COMPRESS_KEY, true)
-        job.getConfiguration.set(AvroJob.CONF_OUTPUT_CODEC, DataFileConstants.SNAPPY_CODEC)
-
-      case "deflate" =>
-        val deflateLevel = spark.conf.get(
-          AVRO_DEFLATE_LEVEL, Deflater.DEFAULT_COMPRESSION.toString).toInt
-        log.info(s"compressing Avro output using deflate (level=$deflateLevel)")
-        job.getConfiguration.setBoolean(COMPRESS_KEY, true)
-        job.getConfiguration.set(AvroJob.CONF_OUTPUT_CODEC, DataFileConstants.DEFLATE_CODEC)
-        job.getConfiguration.setInt(AvroOutputFormat.DEFLATE_LEVEL_KEY, deflateLevel)
-
-      case unknown: String =>
-        log.error(s"unsupported compression codec $unknown")
-    }
-
-    new AvroOutputWriterFactory(dataSchema, outputAvroSchema.toString)
+    AvroUtils.prepareWrite(spark.sessionState.conf, job, options, dataSchema)
   }
 
   override def buildReader(
@@ -157,11 +84,10 @@ private[avro] class AvroFileFormat extends FileFormat with DataSourceRegister {
       hadoopConf: Configuration): (PartitionedFile) => Iterator[InternalRow] = {
 
     val broadcastedConf =
-      spark.sparkContext.broadcast(new AvroFileFormat.SerializableConfiguration(hadoopConf))
+      spark.sparkContext.broadcast(new SerializableConfiguration(hadoopConf))
     val parsedOptions = new AvroOptions(options, hadoopConf)
 
     (file: PartitionedFile) => {
-      val log = LoggerFactory.getLogger(classOf[AvroFileFormat])
       val conf = broadcastedConf.value.value
       val userProvidedSchema = parsedOptions.schema.map(new Schema.Parser().parse)
 
@@ -180,7 +106,7 @@ private[avro] class AvroFileFormat extends FileFormat with DataSourceRegister {
             DataFileReader.openReader(in, datumReader)
           } catch {
             case NonFatal(e) =>
-              log.error("Exception while opening DataFileReader", e)
+              logError("Exception while opening DataFileReader", e)
               in.close()
               throw e
           }
@@ -189,7 +115,7 @@ private[avro] class AvroFileFormat extends FileFormat with DataSourceRegister {
         // Ensure that the reader is closed even if the task fails or doesn't consume the entire
         // iterator of records.
         Option(TaskContext.get()).foreach { taskContext =>
-          taskContext.addTaskCompletionListener { _ =>
+          taskContext.addTaskCompletionListener[Unit] { _ =>
             reader.close()
           }
         }
@@ -229,47 +155,10 @@ private[avro] class AvroFileFormat extends FileFormat with DataSourceRegister {
       }
     }
   }
+
+  override def supportDataType(dataType: DataType): Boolean = AvroUtils.supportsDataType(dataType)
 }
 
 private[avro] object AvroFileFormat {
   val IgnoreFilesWithoutExtensionProperty = "avro.mapred.ignore.inputs.without.extension"
-
-  class SerializableConfiguration(@transient var value: Configuration)
-      extends Serializable with KryoSerializable {
-    @transient private[avro] lazy val log = LoggerFactory.getLogger(getClass)
-
-    private def writeObject(out: ObjectOutputStream): Unit = tryOrIOException {
-      out.defaultWriteObject()
-      value.write(out)
-    }
-
-    private def readObject(in: ObjectInputStream): Unit = tryOrIOException {
-      value = new Configuration(false)
-      value.readFields(in)
-    }
-
-    private def tryOrIOException[T](block: => T): T = {
-      try {
-        block
-      } catch {
-        case e: IOException =>
-          log.error("Exception encountered", e)
-          throw e
-        case NonFatal(e) =>
-          log.error("Exception encountered", e)
-          throw new IOException(e)
-      }
-    }
-
-    def write(kryo: Kryo, out: Output): Unit = {
-      val dos = new DataOutputStream(out)
-      value.write(dos)
-      dos.flush()
-    }
-
-    def read(kryo: Kryo, in: Input): Unit = {
-      value = new Configuration(false)
-      value.readFields(new DataInputStream(in))
-    }
-  }
 }
